@@ -1,30 +1,22 @@
-//  CREATE TABLE seats (
-//      id SERIAL PRIMARY KEY,
-//      name VARCHAR(255),
-//      isbooked INT DEFAULT 0
-//  );
-// INSERT INTO seats (isbooked)
-// SELECT 0 FROM generate_series(1, 20);
-
 import express from "express";
 import pg from "pg";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 import cors from "cors";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
 const port = process.env.PORT || 8080;
 
-// Equivalent to mongoose connection
-// Pool is nothing but group of connections
-// If you pick one connection out of the pool and release it
-// the pooler will keep that connection open for sometime to other clients to reuse
+// Secret key for our VIP passes
+const JWT_SECRET = "chaicode_secret_key_123"; 
+
 const pool = new pg.Pool({
   host: "localhost",
-  port: 5433,
+  port: 5432, 
   user: "postgres",
-  password: "postgres",
+  password: "SQL@123",
   database: "sql_class_2_db",
   max: 20,
   connectionTimeoutMillis: 0,
@@ -33,53 +25,101 @@ const pool = new pg.Pool({
 
 const app = new express();
 app.use(cors());
+app.use(express.json()); 
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; 
+  
+  if (!token) return res.status(401).json({ error: "Stop! You need to login first." });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: "Your pass is fake or expired." });
+    req.user = user; 
+    next();
+  });
+};
 
 app.get("/", (req, res) => {
   res.sendFile(__dirname + "/index.html");
 });
-//get all seats
+
 app.get("/seats", async (req, res) => {
-  const result = await pool.query("select * from seats"); // equivalent to Seats.find() in mongoose
+  const result = await pool.query("select * from seats"); 
   res.send(result.rows);
 });
 
-//book a seat give the seatId and your name
+// 1. REGISTER: Create a new account
+app.post("/register", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Please give a username and password" });
 
-app.put("/:id/:name", async (req, res) => {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const sql = "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username";
+    const result = await pool.query(sql, [username, hashedPassword]);
+
+    res.status(201).json({ message: "Yay! Account created.", user: result.rows[0] });
+  } catch (ex) {
+    // 🕵️‍♂️ OUR DETECTIVE CODE IS HERE!
+    console.log("DETECTIVE ERROR:", ex);
+    if (ex.code === '23505') return res.status(409).json({ error: "Oops! Username is already taken." });
+    res.status(500).json({ error: "Bug found: " + ex.message });
+  }
+});
+
+// 2. LOGIN: Sign in to your account
+app.post("/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+
+    if (result.rowCount === 0) return res.status(401).json({ error: "Wrong username or password" });
+
+    const user = result.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password);
+
+    if (!validPassword) return res.status(401).json({ error: "Wrong username or password" });
+
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: "2h" });
+    res.json({ message: "Login successful!", token: token });
+  } catch (ex) {
+    res.status(500).json({ error: "Bug found: " + ex.message });
+  }
+});
+
+// 3. BOOK A SEAT: 
+app.put("/:id/:name", authenticateToken, async (req, res) => {
   try {
     const id = req.params.id;
-    const name = req.params.name;
-    // payment integration should be here
-    // verify payment
-    const conn = await pool.connect(); // pick a connection from the pool
-    //begin transaction
-    // KEEP THE TRANSACTION AS SMALL AS POSSIBLE
-    await conn.query("BEGIN");
-    //getting the row to make sure it is not booked
-    /// $1 is a variable which we are passing in the array as the second parameter of query function,
-    // Why do we use $1? -> this is to avoid SQL INJECTION
-    // (If you do ${id} directly in the query string,
-    // then it can be manipulated by the user to execute malicious SQL code)
-    const sql = "SELECT * FROM seats where id = $1 and isbooked = 0 FOR UPDATE";
-    const result = await conn.query(sql, [id]);
+    const name = req.user.username; 
 
-    //if no rows found then the operation should fail can't book
-    // This shows we Do not have the current seat available for booking
-    if (result.rowCount === 0) {
-      res.send({ error: "Seat already booked" });
-      return;
+    const conn = await pool.connect();
+    
+    try {
+      await conn.query("BEGIN");
+      
+      const sql = "SELECT * FROM seats where id = $1 and isbooked = 0 FOR UPDATE";
+      const result = await conn.query(sql, [id]);
+
+      if (result.rowCount === 0) {
+        await conn.query("ROLLBACK"); 
+        return res.status(400).json({ error: "Seat is already taken!" });
+      }
+
+      const sqlU = "update seats set isbooked = 1, name = $2 where id = $1";
+      const updateResult = await conn.query(sqlU, [id, name]); 
+
+      await conn.query("COMMIT");
+      res.json({ message: "You booked the seat! Have fun at the movie." });
+    } catch (dbEx) {
+      await conn.query("ROLLBACK");
+      throw dbEx;
+    } finally {
+      conn.release(); 
     }
-    //if we get the row, we are safe to update
-    const sqlU = "update seats set isbooked = 1, name = $2 where id = $1";
-    const updateResult = await conn.query(sqlU, [id, name]); // Again to avoid SQL INJECTION we are using $1 and $2 as placeholders
-
-    //end transaction by committing
-    await conn.query("COMMIT");
-    conn.release(); // release the connection back to the pool (so we do not keep the connection open unnecessarily)
-    res.send(updateResult);
   } catch (ex) {
-    console.log(ex);
-    res.send(500);
+    res.status(500).json({ error: "Bug found: " + ex.message });
   }
 });
 
